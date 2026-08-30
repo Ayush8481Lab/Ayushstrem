@@ -1,88 +1,77 @@
 <?php
-// Copyright 2021-2025 SnehTV, Inc.
-// Licensed under MIT (https://github.com/mitthu786/TS-JioTV/blob/main/LICENSE)
-// Created By: TechieSneh
+// Modified for Direct Streaming (No Server Proxy)
+// This fetches the Jio stream and directs the client straight to Jio's CDN.
 
 error_reporting(0);
 include "functions.php";
 
-// Response headers
+// Response headers for video player
 header("Content-Type: application/vnd.apple.mpegurl");
 header("Access-Control-Allow-Origin: *");
-header("Access-Control-Expose-Headers: Content-Length, Content-Range");
-header("Access-Control-Allow-Headers: Range");
-header("Accept-Ranges: bytes");
 
-// Server configuration
-$protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? 'https://' : 'http://';
-$host_jio = in_array($_SERVER['SERVER_ADDR'], ['127.0.0.1', 'localhost'])
-    ? getHostByName(php_uname('n'))
-    : $_SERVER['HTTP_HOST'];
-
-if (!str_contains($host_jio, $_SERVER['SERVER_PORT'])) {
-    $host_jio .= ':' . $_SERVER['SERVER_PORT'];
-}
-
-$jio_path = rtrim(
-    sprintf('%s%s%s', $protocol, $host_jio, str_replace(' ', '%20', dirname($_SERVER['PHP_SELF']))),
-    '/'
-);
-
-// Request
+// 1. Get the Channel ID
 $id = htmlspecialchars($_REQUEST['id'] ?? '');
 $haystack = getJioTvData($id);
 
+// 2. Check if token needs to be refreshed
 if (empty($haystack->code) || $haystack->code !== 200) {
     refresh_token();
     header("Location: {$_SERVER['REQUEST_URI']}");
     exit;
 }
 
-// Parse response
-[$baseUrl, $query] = array_pad(explode('?', $haystack->result, 2), 2, '');
-$cookies_y = str_contains($query, "minrate=") ? explode("&", $query)[2] : $query;
-$cook = bin2hex($cookies_y);
-$chs = explode('/', $baseUrl);
+// 3. Extract the direct Jio CDN URL from the fetched data
+$jio_url = $haystack->result;
 
-// Playback headers
+// 4. Fetch the raw .m3u8 playlist from Jio
 $headers_1 = ["User-Agent: plaYtv/7.1.3 (Linux;Android 14) ExoPlayerLib/2.11.7"];
+$playlist = cUrlGetData($jio_url, $headers_1);
 
-// Case 1: bpk-tv streams
-if (str_contains($query, "bpk-tv")) {
-    $playlist = cUrlGetData($haystack->result, $headers_1);
-    $replacements = [
-        'URI="' => "URI=\"stream.php?cid=$id&id=",
-        "$chs[4]-video" => "stream.php?cid=$id&id=$chs[4]-video",
-        "$chs[4]-audio" => "stream.php?cid=$id&id=$chs[4]-audio",
-        'URI="stream.php?cid=' . $id . '&id=stream.php?cid=' . $id . '&id='
-        => 'URI="stream.php?cid=' . $id . '&id=',
-        'stream.php?cid=' . $id . '&id=keyframes/stream.php?cid=' . $id . '&id='
-        => 'stream.php?cid=' . $id . '&id=keyframes/',
-        'stream.php?cid=' => "stream.php?ck=$cook&cid="
-    ];
-    echo str_replace(array_keys($replacements), array_values($replacements), $playlist);
-    exit;
-}
+// 5. Parse the Jio URL to get the base path and authentication tokens
+$parsed_url = parse_url($jio_url);
+$base_dir = $parsed_url['scheme'] . '://' . $parsed_url['host'] . substr($parsed_url['path'], 0, strrpos($parsed_url['path'], '/') + 1);
+$query_string = isset($parsed_url['query']) ? $parsed_url['query'] : '';
 
-// Case 2: HLS streams
-if (str_contains($query, "/HLS/")) {
-    $link    = implode('/', array_slice($chs, 0, 5));
-    $link_1  = implode('/', array_slice($chs, 0, 7));
-    $data    = explode("_", $chs[5])[0];
-    $playlist = cUrlGetData($haystack->result, $headers_1);
-
-    $cook = "__hdnea" . explode("__hdnea", hex2bin($cook))[1];
-    $cook = bin2hex($cook);
-
-    $base_url = "s_live.php?id=$id&ck=$cook&link=";
-    if (str_contains($playlist, "WL/")) {
-        echo str_replace([$data, 'WL/'], ["{$base_url}$link&data=$data", "{$base_url}$link_1&data=WL/"], $playlist);
-    } else {
-        echo str_replace([$data, 'WL2/'], ["{$base_url}$link&data=$data", "{$base_url}$link_1&data=WL2/"], $playlist);
+// 6. Fix internal URI tags (like multi-audio tracks) to point to Jio directly
+$playlist = preg_replace_callback('/URI="([^"]+)"/', function($matches) use ($base_dir, $query_string) {
+    $uri = $matches[1];
+    if (!str_starts_with($uri, 'http')) {
+        $uri = $base_dir . $uri; // Make it an absolute Jio URL
     }
-    exit;
+    // Append the Jio token to the URI
+    if (!empty($query_string)) {
+        $separator = str_contains($uri, '?') ? '&' : '?';
+        $uri .= $separator . $query_string;
+    }
+    return 'URI="' . $uri . '"';
+}, $playlist);
+
+// 7. Process the playlist line by line to fix video chunks (.ts files)
+$lines = explode("\n", $playlist);
+$final_playlist = "";
+
+foreach ($lines as $line) {
+    $line = trim($line);
+    if (empty($line)) continue;
+    
+    if (str_starts_with($line, '#')) {
+        // Keep HLS configuration tags exactly as they are
+        $final_playlist .= $line . "\n";
+    } else {
+        // It's a video file path. Make it point directly to Jio instead of proxy.
+        if (!str_starts_with($line, 'http')) {
+            $line = $base_dir . $line;
+        }
+        // Append the Jio authentication token
+        if (!empty($query_string)) {
+            $separator = str_contains($line, '?') ? '&' : '?';
+            $line .= $separator . $query_string;
+        }
+        $final_playlist .= $line . "\n";
+    }
 }
 
-// Case 3: fallback stream
-echo cUrlGetData("https://snehtv.pages.dev/video/tsjiotv.m3u8", $headers_1);
+// 8. Output the final direct playlist to the video player
+echo $final_playlist;
 exit;
+?>

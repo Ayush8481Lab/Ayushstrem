@@ -1,62 +1,87 @@
 <?php
-// DIRECT CDN REWRITER - Forces the player to fetch .ts chunks directly from Jio
+// Copyright 2021-2025 SnehTV, Inc.
+// Licensed under MIT (https://github.com/mitthu786/TS-JioTV/blob/main/LICENSE)
+// Created By: TechieSneh
+
 error_reporting(0);
 include "functions.php";
 
-header("Content-Type: application/vnd.apple.mpegurl");
+// Set response header to JSON
+header("Content-Type: application/json");
 header("Access-Control-Allow-Origin: *");
 
-// 1. Get Channel ID
+// Request variables
 $id = htmlspecialchars($_REQUEST['id'] ?? '');
-if (empty($id)) exit;
-
-// 2. Fetch Master Menu from Jio
+$case = htmlspecialchars($_REQUEST['case'] ?? ''); // Fetch specific case if passed
 $haystack = getJioTvData($id);
+
+// Refresh token if response is invalid
 if (empty($haystack->code) || $haystack->code !== 200) {
     refresh_token();
     header("Location: {$_SERVER['REQUEST_URI']}");
     exit;
 }
 
-$jio_url = $haystack->result;
+// Parse response
+[$baseUrl, $query] = array_pad(explode('?', $haystack->result, 2), 2, '');
+$cookies_y = str_contains($query, "minrate=") ? explode("&", $query)[2] : $query;
+$cook = bin2hex($cookies_y);
+$chs = explode('/', $baseUrl);
 
-// 3. Fetch the content of the Master Menu (index.m3u8)
+// Playback headers
 $headers_1 = ["User-Agent: plaYtv/7.1.3 (Linux;Android 14) ExoPlayerLib/2.11.7"];
-$playlist = cUrlGetData($jio_url, $headers_1);
 
-// 4. Extract Jio's Base Server URL and Authentication Token
-$parsed_url = parse_url($jio_url);
-$base_dir = $parsed_url['scheme'] . '://' . $parsed_url['host'] . substr($parsed_url['path'], 0, strrpos($parsed_url['path'], '/') + 1);
-$query_string = isset($parsed_url['query']) ? '?' . $parsed_url['query'] : '';
+// Initialize JSON response array
+$response = [
+    "id" => $id,
+    "original_url" => $haystack->result,
+    "user_agent" => "plaYtv/7.1.3 (Linux;Android 14) ExoPlayerLib/2.11.7"
+];
 
-// 5. Rewrite the internal playlists to point directly to Jio's CDN
-$lines = explode("\n", $playlist);
-$final_playlist = "";
-
-foreach ($lines as $line) {
-    $line = trim($line);
-    if (empty($line)) continue;
-    
-    if (str_starts_with($line, '#')) {
-        // Fix internal Audio/Video URI tracks
-        if (preg_match('/URI="([^"]+)"/', $line, $matches)) {
-            $uri = $matches[1];
-            if (!str_starts_with($uri, 'http')) {
-                $absolute_uri = $base_dir . $uri . $query_string;
-                $line = str_replace('URI="' . $uri . '"', 'URI="' . $absolute_uri . '"', $line);
-            }
-        }
-        $final_playlist .= $line . "\n";
-    } else {
-        // Convert relative playlist links to absolute Jio links + Append Token
-        if (!str_starts_with($line, 'http')) {
-            $line = $base_dir . $line . $query_string;
-        }
-        $final_playlist .= $line . "\n";
-    }
+if (!empty($case)) {
+    $response["case_requested"] = $case;
 }
 
-// 6. Output the rewritten playlist to your video player
-echo $final_playlist;
+// Determine logic based on provided case, otherwise fallback to URL query matching
+$is_case_1 = ($case == '1' || (empty($case) && str_contains($query, "bpk-tv")));
+$is_case_2 = ($case == '2' || (empty($case) && str_contains($query, "/HLS/")));
+
+if ($is_case_1) {
+    // Case 1: bpk-tv streams
+    $playlist = cUrlGetData($haystack->result, $headers_1);
+    
+    $response["stream_type"] = "bpk-tv";
+    $response["cookie"] = $cookies_y;
+    $response["cookie_hex"] = $cook;
+    $response["raw_playlist"] = $playlist; // Returns original, unmodified M3U8 text
+
+} elseif ($is_case_2) {
+    // Case 2: HLS streams
+    $playlist = cUrlGetData($haystack->result, $headers_1);
+
+    // Extract HLS Cookie safely
+    $cook_decoded = hex2bin($cook);
+    if (str_contains($cook_decoded, "__hdnea")) {
+        $cook_final = "__hdnea" . explode("__hdnea", $cook_decoded)[1];
+    } else {
+        $cook_final = $cook_decoded;
+    }
+
+    $response["stream_type"] = "HLS";
+    $response["cookie"] = $cook_final;
+    $response["cookie_hex"] = bin2hex($cook_final);
+    $response["raw_playlist"] = $playlist; // Returns original, unmodified M3U8 text
+
+} else {
+    // Case 3: fallback stream
+    $fallback_url = "https://snehtv.pages.dev/video/tsjiotv.m3u8";
+    $playlist = cUrlGetData($fallback_url, $headers_1);
+    
+    $response["stream_type"] = "fallback";
+    $response["original_url"] = $fallback_url;
+    $response["raw_playlist"] = $playlist;
+}
+
+// Echo structured JSON response
+echo json_encode($response, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
 exit;
-?>
